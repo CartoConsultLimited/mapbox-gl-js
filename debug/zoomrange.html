@@ -28,24 +28,24 @@ var map = window.map = new mapboxgl.Map({
 
 map.on('load', function() {
     map.addLayer({
-      "id": "circle",
-      "type": "circle",
-      "source": {
-          "type": "geojson",
-          "data": {
-            "type": "Point",
-            "coordinates": [
-              0,
-              0
-            ]
-          }
+        "id": "circle",
+        "type": "circle",
+        "source": {
+            "type": "geojson",
+            "data": {
+                "type": "Point",
+                "coordinates": [
+                    0,
+                    0
+                ]
+            }
         },
-      "minzoom": 1,
-      "maxzoom": 2,
-      'paint': {
-        'circle-color': 'red'
-      }
-    })
+        "minzoom": 1,
+        "maxzoom": 2,
+        'paint': {
+            'circle-color': 'red'
+        }
+    });
     map.setLayerZoomRange('circle', 0, 3);
 });
 </script>

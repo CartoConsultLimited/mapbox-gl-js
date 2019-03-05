@@ -88,7 +88,7 @@ function drawExtrusionTiles(painter, source, layer, coords, depthMode, stencilMo
             fillExtrusionUniformValues(matrix, painter, shouldUseVerticalGradient, opacity);
 
 
-        program.draw(context, context.gl.TRIANGLES, depthMode, stencilMode, colorMode, CullFaceMode.backCCW,
+        program.draw(context, context.gl.TRIANGLES, depthMode, stencilMode, colorMode, CullFaceMode.disabled,
             uniformValues, layer.id, bucket.layoutVertexBuffer, bucket.indexBuffer,
             bucket.segments, layer.paint, painter.transform.zoom,
             programConfiguration);

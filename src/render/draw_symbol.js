@@ -155,7 +155,9 @@ function drawLayerSymbols(painter, sourceCache, layer, coords, isText, translate
 
     const sortFeaturesByKey = layer.layout.get('symbol-sort-key').constantOr(1) !== undefined;
 
-    const depthMode = painter.depthModeForSublayer(0, DepthMode.ReadOnly);
+    const depthOn = pitchWithMap;
+
+    const depthMode = depthOn ? painter.depthModeForSublayer(0, DepthMode.ReadOnly) : DepthMode.disabled;
 
     let program;
     let size;

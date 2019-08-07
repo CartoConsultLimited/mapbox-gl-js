@@ -2,7 +2,7 @@
 <script>
 var map = new mapboxgl.Map({
     container: 'map',
-    style: 'mapbox://styles/mapbox/light-v9',
+    style: 'mapbox://styles/mapbox/light-v10',
     center: [-87.62712, 41.89033],
     zoom: 15.5,
     pitch: 45
@@ -15,7 +15,6 @@ function rotateCamera(timestamp) {
     // Request the next frame of the animation.
     requestAnimationFrame(rotateCamera);
 }
-
 
 map.on('load', function () {
     // Start the animation.

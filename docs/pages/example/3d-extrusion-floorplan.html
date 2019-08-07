@@ -2,11 +2,12 @@
 <script>
 var map = new mapboxgl.Map({
     container: 'map',
-    style: 'mapbox://styles/mapbox/streets-v9',
+    style: 'mapbox://styles/mapbox/streets-v11',
     center: [-87.61694, 41.86625],
     zoom: 15.99,
     pitch: 40,
-    bearing: 20
+    bearing: 20,
+    antialias: true
 });
 
 map.on('load', function() {

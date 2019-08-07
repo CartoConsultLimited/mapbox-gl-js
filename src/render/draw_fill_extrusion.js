@@ -87,8 +87,12 @@ function drawExtrusionTiles(painter, source, layer, coords, depthMode, stencilMo
             fillExtrusionPatternUniformValues(matrix, painter, shouldUseVerticalGradient, opacity, coord, crossfade, tile) :
             fillExtrusionUniformValues(matrix, painter, shouldUseVerticalGradient, opacity);
 
+<<<<<<< HEAD
 
         program.draw(context, context.gl.TRIANGLES, depthMode, stencilMode, colorMode, CullFaceMode.disabled,
+=======
+        program.draw(context, context.gl.TRIANGLES, depthMode, stencilMode, colorMode, CullFaceMode.backCCW,
+>>>>>>> upstream/master
             uniformValues, layer.id, bucket.layoutVertexBuffer, bucket.indexBuffer,
             bucket.segments, layer.paint, painter.transform.zoom,
             programConfiguration);

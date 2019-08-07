@@ -1,13 +1,12 @@
 // @flow
 
 import { extend, bindAll, warnOnce, uniqueId } from '../util/util';
-
 import browser from '../util/browser';
 import window from '../util/window';
 const { HTMLImageElement, HTMLElement } = window;
 import DOM from '../util/dom';
 import { getImage, getJSON, ResourceType } from '../util/ajax';
-import { normalizeStyleURL } from '../util/mapbox';
+import { RequestManager } from '../util/mapbox';
 import Style from '../style/style';
 import EvaluationParameters from '../style/evaluation_parameters';
 import Painter from '../render/painter';
@@ -26,14 +25,16 @@ import { Event, ErrorEvent } from '../util/evented';
 import { MapMouseEvent } from './events';
 import TaskQueue from '../util/task_queue';
 import webpSupported from '../util/webp_supported';
+import { setCacheLimits } from '../util/tile_request_cache';
 
 import type {PointLike} from '@mapbox/point-geometry';
+import type { RequestTransformFunction } from '../util/mapbox';
 import type {LngLatLike} from '../geo/lng_lat';
 import type {LngLatBoundsLike} from '../geo/lng_lat_bounds';
-import type {RequestParameters} from '../util/ajax';
 import type {StyleOptions, StyleSetterOptions} from '../style/style';
 import type {MapEvent, MapDataEvent} from './events';
 import type {CustomLayerInterface} from '../style/style_layer/custom_style_layer';
+import type {StyleImageInterface} from '../style/style_image';
 
 import type ScrollZoomHandler from './handler/scroll_zoom';
 import type BoxZoomHandler from './handler/box_zoom';
@@ -61,9 +62,6 @@ type IControl = {
     +getDefaultPosition?: () => ControlPosition;
 }
 /* eslint-enable no-use-before-define */
-
-type ResourceTypeEnum = $Keys<typeof ResourceType>;
-export type RequestTransformFunction = (url: string, resourceType?: ResourceTypeEnum) => RequestParameters;
 
 type MapOptions = {
     hash?: boolean,
@@ -94,7 +92,8 @@ type MapOptions = {
     pitch?: number,
     renderWorldCopies?: boolean,
     maxTileCacheSize?: number,
-    transformRequest?: RequestTransformFunction
+    transformRequest?: RequestTransformFunction,
+    accessToken: string
 };
 
 const defaultMinZoom = 0;
@@ -129,7 +128,9 @@ const defaultOptions = {
     renderWorldCopies: true,
     refreshExpiredTiles: true,
     maxTileCacheSize: null,
+    localIdeographFontFamily: 'sans-serif',
     transformRequest: null,
+    accessToken: null,
     fadeDuration: 300,
     crossSourceCollisions: true
 };
@@ -203,15 +204,18 @@ const defaultOptions = {
  * @param {Object} [options.fitBoundsOptions] A [`fitBounds`](#map#fitbounds) options object to use _only_ when fitting the initial `bounds` provided above.
  * @param {boolean} [options.renderWorldCopies=true]  If `true`, multiple copies of the world will be rendered, when zoomed out.
  * @param {number} [options.maxTileCacheSize=null]  The maximum number of tiles stored in the tile cache for a given source. If omitted, the cache will be dynamically sized based on the current viewport.
- * @param {string} [options.localIdeographFontFamily=null] If specified, defines a CSS font-family
- *   for locally overriding generation of glyphs in the 'CJK Unified Ideographs' and 'Hangul Syllables' ranges.
+ * @param {string} [options.localIdeographFontFamily='sans-serif'] Defines a CSS
+ *   font-family for locally overriding generation of glyphs in the 'CJK Unified Ideographs', 'Hiragana', 'Katakana' and 'Hangul Syllables' ranges.
  *   In these ranges, font settings from the map's style will be ignored, except for font-weight keywords (light/regular/medium/bold).
+ *   Set to `false`, to enable font settings from the map's style for these glyph ranges.
  *   The purpose of this option is to avoid bandwidth-intensive glyph server requests. (see [Use locally generated ideographs](https://www.mapbox.com/mapbox-gl-js/example/local-ideographs))
  * @param {RequestTransformFunction} [options.transformRequest=null] A callback run before the Map makes a request for an external URL. The callback can be used to modify the url, set headers, or set the credentials property for cross-origin requests.
  *   Expected to return an object with a `url` property and optionally `headers` and `credentials` properties.
  * @param {boolean} [options.collectResourceTiming=false] If `true`, Resource Timing API information will be collected for requests made by GeoJSON and Vector Tile web workers (this information is normally inaccessible from the main Javascript thread). Information will be returned in a `resourceTiming` property of relevant `data` events.
  * @param {number} [options.fadeDuration=300] Controls the duration of the fade-in/fade-out animation for label collisions, in milliseconds. This setting affects all symbol layers. This setting does not affect the duration of runtime styling transitions or raster tile cross-fading.
  * @param {boolean} [options.crossSourceCollisions=true] If `true`, symbols from multiple sources can collide with each other during collision detection. If `false`, collision detection is run separately for the symbols in each source.
+ * @param {string} [options.accessToken=null] If specified, map will use this token instead of the one defined in mapboxgl.accessToken.
+
  * @example
  * var map = new mapboxgl.Map({
  *   container: 'map',
@@ -247,7 +251,6 @@ class Map extends Camera {
     _repaint: ?boolean;
     _vertices: ?boolean;
     _canvas: HTMLCanvasElement;
-    _transformRequest: RequestTransformFunction;
     _maxTileCacheSize: number;
     _frame: ?Cancelable;
     _styleDirty: ?boolean;
@@ -268,6 +271,8 @@ class Map extends Camera {
     _renderTaskQueue: TaskQueue;
     _controls: Array<IControl>;
     _mapId: number;
+    _localIdeographFontFamily: string;
+    _requestManager: RequestManager;
 
     /**
      * The map's {@link ScrollZoomHandler}, which implements zooming in and out with a scroll wheel or trackpad.
@@ -332,10 +337,7 @@ class Map extends Camera {
         this._controls = [];
         this._mapId = uniqueId();
 
-        const transformRequestFn = options.transformRequest;
-        this._transformRequest = transformRequestFn ?
-            (url, type) => transformRequestFn(url, type) || ({ url }) :
-            (url) => ({ url });
+        this._requestManager = new RequestManager(options.transformRequest, options.accessToken);
 
         if (typeof options.container === 'string') {
             this._container = window.document.getElementById(options.container);
@@ -394,6 +396,7 @@ class Map extends Camera {
 
         this.resize();
 
+        this._localIdeographFontFamily = options.localIdeographFontFamily;
         if (options.style) this.setStyle(options.style, { localIdeographFontFamily: options.localIdeographFontFamily });
 
         if (options.attributionControl)
@@ -812,6 +815,7 @@ class Map extends Camera {
      *   Only features within these layers will be returned. If this parameter is undefined, all layers will be checked.
      * @param {Array} [options.filter] A [filter](https://www.mapbox.com/mapbox-gl-js/style-spec/#other-filter)
      *   to limit query results.
+     * @param {boolean} [options.validate=true] Whether to check if the [options.filter] conforms to the Mapbox GL Style Specification. Disabling validation is a performance optimization that should only be used if you have previously validated the values you will be passing to this function.
      *
      * @returns {Array<Object>} An array of [GeoJSON](http://geojson.org/)
      * [feature objects](https://tools.ietf.org/html/rfc7946#section-3.2).
@@ -916,6 +920,7 @@ class Map extends Camera {
      *   sources, this parameter is required.* For GeoJSON sources, it is ignored.
      * @param {Array} [parameters.filter] A [filter](https://www.mapbox.com/mapbox-gl-js/style-spec/#other-filter)
      *   to limit query results.
+     * @param {boolean} [parameters.validate=true] Whether to check if the [parameters.filter] conforms to the Mapbox GL Style Specification. Disabling validation is a performance optimization that should only be used if you have previously validated the values you will be passing to this function.
      *
      * @returns {Array<Object>} An array of [GeoJSON](http://geojson.org/)
      * [Feature objects](https://tools.ietf.org/html/rfc7946#section-3.2).
@@ -936,7 +941,7 @@ class Map extends Camera {
      * @see [Filter features within map view](https://www.mapbox.com/mapbox-gl-js/example/filter-features-within-map-view/)
      * @see [Highlight features containing similar data](https://www.mapbox.com/mapbox-gl-js/example/query-similar-features/)
      */
-    querySourceFeatures(sourceId: string, parameters: ?{sourceLayer: ?string, filter: ?Array<any>}) {
+    querySourceFeatures(sourceId: string, parameters: ?{sourceLayer: ?string, filter: ?Array<any>, validate?: boolean}) {
         return this.style.querySourceFeatures(sourceId, parameters);
     }
 
@@ -950,17 +955,22 @@ class Map extends Camera {
      * @param {Object} [options]
      * @param {boolean} [options.diff=true] If false, force a 'full' update, removing the current style
      *   and building the given one instead of attempting a diff-based update.
-     * @param {string} [options.localIdeographFontFamily=null] If non-null, defines a css font-family
-     *   for locally overriding generation of glyphs in the 'CJK Unified Ideographs' and 'Hangul Syllables'
-     *   ranges. Forces a full update.
+     * @param {string} [options.localIdeographFontFamily='sans-serif'] Defines a CSS
+     *   font-family for locally overriding generation of glyphs in the 'CJK Unified Ideographs', 'Hiragana', 'Katakana' and 'Hangul Syllables' ranges.
+     *   In these ranges, font settings from the map's style will be ignored, except for font-weight keywords (light/regular/medium/bold).
+     *   Set to `false`, to enable font settings from the map's style for these glyph ranges.
+     *   Forces a full update.
      * @returns {Map} `this`
      * @see [Change a map's style](https://www.mapbox.com/mapbox-gl-js/example/setstyle/)
      */
     setStyle(style: StyleSpecification | string | null, options?: {diff?: boolean} & StyleOptions) {
-        if ((!options || (options.diff !== false && !options.localIdeographFontFamily)) && this.style && style) {
+        options = extend({}, { localIdeographFontFamily: defaultOptions.localIdeographFontFamily}, options);
+
+        if ((options.diff !== false && options.localIdeographFontFamily === this._localIdeographFontFamily) && this.style && style) {
             this._diffStyle(style, options);
             return this;
         } else {
+            this._localIdeographFontFamily = options.localIdeographFontFamily;
             return this._updateStyle(style, options);
         }
     }
@@ -991,8 +1001,8 @@ class Map extends Camera {
 
     _diffStyle(style: StyleSpecification | string,  options?: {diff?: boolean} & StyleOptions) {
         if (typeof style === 'string') {
-            const url = normalizeStyleURL(style);
-            const request = this._transformRequest(url, ResourceType.Style);
+            const url = this._requestManager.normalizeStyleURL(style);
+            const request = this._requestManager.transformRequest(url, ResourceType.Style);
             getJSON(request, (error: ?Error, json: ?Object) => {
                 if (error) {
                     this.fire(new ErrorEvent(error));
@@ -1145,19 +1155,71 @@ class Map extends Camera {
      * @param options.sdf Whether the image should be interpreted as an SDF image
      */
     addImage(id: string,
-             image: HTMLImageElement | ImageData | {width: number, height: number, data: Uint8Array | Uint8ClampedArray},
+             image: HTMLImageElement | ImageData | {width: number, height: number, data: Uint8Array | Uint8ClampedArray} | StyleImageInterface,
              {pixelRatio = 1, sdf = false}: {pixelRatio?: number, sdf?: boolean} = {}) {
+
+        const version = 0;
+
         if (image instanceof HTMLImageElement) {
             const {width, height, data} = browser.getImageData(image);
-            this.style.addImage(id, { data: new RGBAImage({width, height}, data), pixelRatio, sdf });
+            this.style.addImage(id, { data: new RGBAImage({width, height}, data), pixelRatio, sdf, version });
         } else if (image.width === undefined || image.height === undefined) {
             return this.fire(new ErrorEvent(new Error(
                 'Invalid arguments to map.addImage(). The second argument must be an `HTMLImageElement`, `ImageData`, ' +
                 'or object with `width`, `height`, and `data` properties with the same format as `ImageData`')));
         } else {
             const {width, height, data} = image;
-            this.style.addImage(id, { data: new RGBAImage({width, height}, new Uint8Array(data)), pixelRatio, sdf });
+            const userImage = ((image: any): StyleImageInterface);
+
+            this.style.addImage(id, {
+                data: new RGBAImage({width, height}, new Uint8Array(data)),
+                pixelRatio,
+                sdf,
+                version,
+                userImage
+            });
+
+            if (userImage.onAdd) {
+                userImage.onAdd(this, id);
+            }
         }
+    }
+
+    /**
+     * Update an existing style image. This image can be used in `icon-image`,
+     * `background-pattern`, `fill-pattern`, and `line-pattern`.
+     *
+     * @param id The ID of the image.
+     * @param image The image as an `HTMLImageElement`, `ImageData`, or object with `width`, `height`, and `data`
+     * properties with the same format as `ImageData`.
+     */
+    updateImage(id: string,
+        image: HTMLImageElement | ImageData | {width: number, height: number, data: Uint8Array | Uint8ClampedArray} | StyleImageInterface) {
+
+        const existingImage = this.style.getImage(id);
+        if (!existingImage) {
+            return this.fire(new ErrorEvent(new Error(
+                'The map has no image with that id. If you are adding a new image use `map.addImage(...)` instead.')));
+        }
+
+        const imageData = image instanceof HTMLImageElement ? browser.getImageData(image) : image;
+        const {width, height, data} = imageData;
+
+        if (width === undefined || height === undefined) {
+            return this.fire(new ErrorEvent(new Error(
+                'Invalid arguments to map.updateImage(). The second argument must be an `HTMLImageElement`, `ImageData`, ' +
+                'or object with `width`, `height`, and `data` properties with the same format as `ImageData`')));
+        }
+
+        if (width !== existingImage.data.width || height !== existingImage.data.height) {
+            return this.fire(new ErrorEvent(new Error(
+                'The width and height of the updated image must be that same as the previous version of the image')));
+        }
+
+        const copy = !(image instanceof HTMLImageElement);
+        existingImage.data.replace(data, copy);
+
+        this.style.updateImage(id, existingImage);
     }
 
     /**
@@ -1192,7 +1254,7 @@ class Map extends Camera {
      * @see [Add an icon to the map](https://www.mapbox.com/mapbox-gl-js/example/add-image/)
      */
     loadImage(url: string, callback: Function) {
-        getImage(this._transformRequest(url, ResourceType.Image), callback);
+        getImage(this._requestManager.transformRequest(url, ResourceType.Image), callback);
     }
 
     /**
@@ -1394,6 +1456,8 @@ class Map extends Camera {
 
     /**
      * Sets the state of a feature. The `state` object is merged in with the existing state of the feature.
+     * Features are identified by their `id` attribute, which must be an integer or a string that can be
+     * cast to an integer.
      *
      * @param {Object} feature Feature identifier. Feature objects returned from
      * {@link Map#queryRenderedFeatures} or event handlers can be used as feature identifiers.
@@ -1404,7 +1468,7 @@ class Map extends Camera {
      * @param {Object} state A set of key-value pairs. The values should be valid JSON types.
      *
      * This method requires the `feature.id` attribute on data sets. For GeoJSON sources without
-     * feature ids, set the `generateIds` option in the `GeoJSONSourceSpecification` to auto-assign them. This
+     * feature ids, set the `generateId` option in the `GeoJSONSourceSpecification` to auto-assign them. This
      * option assigns ids based on a feature's index in the source data. If you change feature data using
      * `map.getSource('some id').setData(..)`, you may need to re-apply state taking into account updated `id` values.
      */
@@ -1418,7 +1482,8 @@ class Map extends Camera {
      * source is specified, removes all states of that source. If
      * target.id is also specified, removes all keys for that feature's state.
      * If key is also specified, removes that key from that feature's state.
-     *
+     * Features are identified by their `id` attribute, which must be an integer or a string that can be
+     * cast to an integer.
      * @param {Object} target Identifier of where to set state: can be a source, a feature, or a specific key of feature.
      * Feature objects returned from {@link Map#queryRenderedFeatures} or event handlers can be used as feature identifiers.
      * @param {string | number} target.id (optional) Unique id of the feature. Optional if key is not specified.
@@ -1434,6 +1499,8 @@ class Map extends Camera {
 
     /**
      * Gets the state of a feature.
+     * Features are identified by their `id` attribute, which must be an integer or a string that can be
+     * cast to an integer.
      *
      * @param {Object} feature Feature identifier. Feature objects returned from
      * {@link Map#queryRenderedFeatures} or event handlers can be used as feature identifiers.
@@ -1789,7 +1856,11 @@ class Map extends Camera {
 
     /**
      * Gets and sets a Boolean indicating whether the map will render an outline
-     * around each tile. These tile boundaries are useful for debugging.
+     * around each tile and the tile ID. These tile boundaries are useful for
+     * debugging.
+     *
+     * The uncompressed file size of the first vector source is drawn in the top left
+     * corner of each tile, next to the tile ID.
      *
      * @name showTileBoundaries
      * @type {boolean}
@@ -1866,6 +1937,11 @@ class Map extends Camera {
     // show vertices
     get vertices(): boolean { return !!this._vertices; }
     set vertices(value: boolean) { this._vertices = value; this._update(); }
+
+    // for cache browser tests
+    _setCacheLimits(limit: number, checkThreshold: number) {
+        setCacheLimits(limit, checkThreshold);
+    }
 }
 
 export default Map;

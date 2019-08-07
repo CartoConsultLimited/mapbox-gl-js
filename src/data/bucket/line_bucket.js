@@ -52,6 +52,9 @@ const EXTRUDE_SCALE = 63;
 const COS_HALF_SHARP_CORNER = Math.cos(75 / 2 * (Math.PI / 180));
 const SHARP_CORNER_OFFSET = 15;
 
+// Angle per triangle for approximating round line joins.
+const DEG_PER_TRIANGLE = 20;
+
 // The number of bits that is used to store the line distance in the buffer.
 const LINE_DISTANCE_BUFFER_BITS = 15;
 
@@ -66,10 +69,9 @@ const MAX_LINE_DISTANCE = Math.pow(2, LINE_DISTANCE_BUFFER_BITS - 1) / LINE_DIST
 function addLineVertex(layoutVertexBuffer, point: Point, extrude: Point, round: boolean, up: boolean, dir: number, linesofar: number) {
     layoutVertexBuffer.emplaceBack(
         // a_pos_normal
-        point.x,
-        point.y,
-        round ? 1 : 0,
-        up ? 1 : -1,
+        // Encode round/up the least significant bits
+        (point.x << 1) + (round ? 1 : 0),
+        (point.y << 1) + (up ? 1 : 0),
         // a_data
         // add 128 to store a byte in an unsigned byte
         Math.round(EXTRUDE_SCALE * extrude.x) + 128,
@@ -82,7 +84,6 @@ function addLineVertex(layoutVertexBuffer, point: Point, extrude: Point, round: 
         ((dir === 0 ? 0 : (dir < 0 ? -1 : 1)) + 1) | (((linesofar * LINE_DISTANCE_SCALE) & 0x3F) << 2),
         (linesofar * LINE_DISTANCE_SCALE) >> 6);
 }
-
 
 /**
  * @private
@@ -100,7 +101,7 @@ class LineBucket implements Bucket {
     layerIds: Array<string>;
     stateDependentLayers: Array<any>;
     stateDependentLayerIds: Array<string>;
-    features: Array<BucketFeature>;
+    patternFeatures: Array<BucketFeature>;
 
     layoutVertexArray: LineLayoutArray;
     layoutVertexBuffer: VertexBuffer;
@@ -119,8 +120,8 @@ class LineBucket implements Bucket {
         this.layers = options.layers;
         this.layerIds = this.layers.map(layer => layer.id);
         this.index = options.index;
-        this.features = [];
         this.hasPattern = false;
+        this.patternFeatures = [];
 
         this.layoutVertexArray = new LineLayoutArray();
         this.indexArray = new TriangleIndexArray();
@@ -131,33 +132,52 @@ class LineBucket implements Bucket {
     }
 
     populate(features: Array<IndexedFeature>, options: PopulateParameters) {
-        this.features = [];
         this.hasPattern = hasPattern('line', this.layers, options);
+        const lineSortKey = this.layers[0].layout.get('line-sort-key');
+        const bucketFeatures = [];
 
         for (const {feature, index, sourceLayerIndex} of features) {
             if (!this.layers[0]._featureFilter(new EvaluationParameters(this.zoom), feature)) continue;
 
             const geometry = loadGeometry(feature);
+            const sortKey = lineSortKey ?
+                lineSortKey.evaluate(feature, {}) :
+                undefined;
 
-            const patternFeature: BucketFeature = {
+            const bucketFeature: BucketFeature = {
+                id: feature.id,
+                properties: feature.properties,
+                type: feature.type,
                 sourceLayerIndex,
                 index,
                 geometry,
-                properties: feature.properties,
-                type: feature.type,
-                patterns: {}
+                patterns: {},
+                sortKey
             };
 
-            if (typeof feature.id !== 'undefined') {
-                patternFeature.id = feature.id;
-            }
+            bucketFeatures.push(bucketFeature);
+        }
+
+        if (lineSortKey) {
+            bucketFeatures.sort((a, b) => {
+                // a.sortKey is always a number when in use
+                return ((a.sortKey: any): number) - ((b.sortKey: any): number);
+            });
+        }
+
+        for (const bucketFeature of bucketFeatures) {
+            const {geometry, index, sourceLayerIndex} = bucketFeature;
 
             if (this.hasPattern) {
-                this.features.push(addPatternDependencies('line', this.layers, patternFeature, this.zoom, options));
+                const patternBucketFeature = addPatternDependencies('line', this.layers, bucketFeature, this.zoom, options);
+                // pattern features are added only once the pattern is loaded into the image atlas
+                // so are stored during populate until later updated with positions by tile worker in addFeatures
+                this.patternFeatures.push(patternBucketFeature);
             } else {
-                this.addFeature(patternFeature, geometry, index, {});
+                this.addFeature(bucketFeature, geometry, index, {});
             }
 
+            const feature = features[index].feature;
             options.featureIndex.insert(feature, geometry, index, sourceLayerIndex, this.index);
         }
     }
@@ -168,9 +188,8 @@ class LineBucket implements Bucket {
     }
 
     addFeatures(options: PopulateParameters, imagePositions: {[string]: ImagePosition}) {
-        for (const feature of this.features) {
-            const {geometry} = feature;
-            this.addFeature(feature, geometry, feature.index, imagePositions);
+        for (const feature of this.patternFeatures) {
+            this.addFeature(feature, feature.geometry, feature.index, imagePositions);
         }
     }
 
@@ -315,11 +334,16 @@ class LineBucket implements Bucket {
              *
              */
 
-            // Calculate the length of the miter (the ratio of the miter to the width).
-            // Find the cosine of the angle between the next and join normals
-            // using dot product. The inverse of that is the miter length.
+            // calculate cosines of the angle (and its half) using dot product
+            const cosAngle = prevNormal.x * nextNormal.x + prevNormal.y * nextNormal.y;
             const cosHalfAngle = joinNormal.x * nextNormal.x + joinNormal.y * nextNormal.y;
+
+            // Calculate the length of the miter (the ratio of the miter to the width)
+            // as the inverse of cosine of the angle between next and join normals
             const miterLength = cosHalfAngle !== 0 ? 1 / cosHalfAngle : Infinity;
+
+            // approximate angle from cosine
+            const approxAngle = 2 * Math.sqrt(2 - 2 * cosHalfAngle);
 
             const isSharpCorner = cosHalfAngle < COS_HALF_SHARP_CORNER && prevVertex && nextVertex;
 
@@ -404,21 +428,20 @@ class LineBucket implements Bucket {
                     // Create a round join by adding multiple pie slices. The join isn't actually round, but
                     // it looks like it is at the sizes we render lines at.
 
-                    // Add more triangles for sharper angles.
-                    // This math is just a good enough approximation. It isn't "correct".
-                    const n = Math.floor((0.5 - (cosHalfAngle - 0.5)) * 8);
-                    let approxFractionalJoinNormal;
+                    // pick the number of triangles for approximating round join by based on the angle between normals
+                    const n = Math.round((approxAngle * 180 / Math.PI) / DEG_PER_TRIANGLE);
 
-                    for (let m = 0; m < n; m++) {
-                        approxFractionalJoinNormal = nextNormal.mult((m + 1) / (n + 1))._add(prevNormal)._unit();
-                        this.addPieSliceVertex(currentVertex, this.distance, approxFractionalJoinNormal, lineTurnsLeft, segment, lineDistances);
-                    }
-
-                    this.addPieSliceVertex(currentVertex, this.distance, joinNormal, lineTurnsLeft, segment, lineDistances);
-
-                    for (let k = n - 1; k >= 0; k--) {
-                        approxFractionalJoinNormal = prevNormal.mult((k + 1) / (n + 1))._add(nextNormal)._unit();
-                        this.addPieSliceVertex(currentVertex, this.distance, approxFractionalJoinNormal, lineTurnsLeft, segment, lineDistances);
+                    for (let m = 1; m < n; m++) {
+                        let t = m / n;
+                        if (t !== 0.5) {
+                            // approximate spherical interpolation https://observablehq.com/@mourner/approximating-geometric-slerp
+                            const t2 = t - 0.5;
+                            const A = 1.0904 + cosAngle * (-3.2452 + cosAngle * (3.55645 - cosAngle * 1.43519));
+                            const B = 0.848013 + cosAngle * (-1.06021 + cosAngle * 0.215638);
+                            t = t + t * t2 * (t - 1) * (A * t2 * t2 + B);
+                        }
+                        const approxFractionalNormal = prevNormal.mult(1 - t)._add(nextNormal.mult(t))._unit();
+                        this.addPieSliceVertex(currentVertex, this.distance, approxFractionalNormal, lineTurnsLeft, segment, lineDistances);
                     }
                 }
 
@@ -465,7 +488,6 @@ class LineBucket implements Bucket {
                     // The segment is done. Unset vertices to disconnect segments.
                     this.e1 = this.e2 = -1;
                 }
-
 
                 // Start next segment with a butt
                 if (nextVertex) {
@@ -626,6 +648,6 @@ function calculateFullDistance(vertices: Array<Point>, first: number, len: numbe
     return total;
 }
 
-register('LineBucket', LineBucket, {omit: ['layers', 'features']});
+register('LineBucket', LineBucket, {omit: ['layers', 'patternFeatures']});
 
 export default LineBucket;

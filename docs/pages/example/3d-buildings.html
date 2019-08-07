@@ -1,12 +1,13 @@
 <div id='map'></div>
 <script>
 var map = new mapboxgl.Map({
-    style: 'mapbox://styles/mapbox/light-v9',
+    style: 'mapbox://styles/mapbox/light-v10',
     center: [-74.0066, 40.7135],
     zoom: 15.5,
     pitch: 45,
     bearing: -17.6,
-    container: 'map'
+    container: 'map',
+    antialias: true
 });
 
 // The 'building' layer in the mapbox-streets vector source contains building-height
